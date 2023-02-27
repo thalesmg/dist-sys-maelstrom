@@ -2,4 +2,8 @@
   ./maelstrom test -w echo --bin ../dist-sys-maelstrom/echo.sh --node-count 1 --time-limit 10
 
   ./maelstrom test -w unique-ids --bin ../dist-sys-maelstrom/unique-ids.sh --node-count 3 --time-limit 30 --rate 1000 --availability total --nemesis partition
+
+  ./maelstrom test -w broadcast --bin ../dist-sys-maelstrom/broadcast.sh --node-count 1 --time-limit 20 --rate 10
+
+  ./maelstrom test -w broadcast --bin ../dist-sys-maelstrom/broadcast.sh --node-count 5 --time-limit 20 --rate 10
 #+END_SRC

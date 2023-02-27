@@ -1,10 +1,12 @@
 #!/usr/bin/env bb
-(ns unique-ids
+(ns broadcast
   (:require
    [common.core :refer :all]))
 
 (def node-id (atom ""))
 (def next-message-id (atom 0))
+(def seen (atom []))
+(def topology (atom {}))
 
 (defn process-request
   [input]
@@ -18,12 +20,26 @@
         (reply @node-id
                (:src input)
                (assoc r-body :type "init_ok")))
-      "generate"
+      "broadcast"
+      (do
+        (swap! seen conj (:message body))
+        (reply @node-id
+               (:src input)
+               (assoc r-body
+                      :type "broadcast_ok")))
+      "read"
       (reply @node-id
              (:src input)
              (assoc r-body
-                    :type "generate_ok"
-                    :id (str @node-id "/" @next-message-id))))))
+                    :type "read_ok"
+                    :messages @seen))
+      "topology"
+      (do
+        (reset! topology (:topology body))
+        (reply @node-id
+               (:src input)
+               (assoc r-body
+                      :type "topology_ok"))))))
 
 
 (defn -main
