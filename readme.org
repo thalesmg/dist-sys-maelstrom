@@ -1,0 +1,3 @@
+#+BEGIN_SRC sh
+  ./maelstrom test -w echo --bin ../dist-sys-maelstrom/echo.sh --node-count 1 --time-limit 10
+#+END_SRC
