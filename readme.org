@@ -1,3 +1,5 @@
 #+BEGIN_SRC sh
   ./maelstrom test -w echo --bin ../dist-sys-maelstrom/echo.sh --node-count 1 --time-limit 10
+
+  ./maelstrom test -w unique-ids --bin ../dist-sys-maelstrom/unique-ids.sh --node-count 3 --time-limit 30 --rate 1000 --availability total --nemesis partition
 #+END_SRC
