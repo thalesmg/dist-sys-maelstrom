@@ -12,7 +12,6 @@
   (doseq [line (line-seq (java.io.BufferedReader. *in*))]
     (handler line)))
 
-
 (defn parse-json
   "Parse the received input as json"
   [input]
@@ -21,27 +20,26 @@
     (catch Exception e
       nil)))
 
-
 ;;;;;; Output Generating functions ;;;;;;
 
 (defn generate-json
   "Generate json string from input"
   [input]
-  (json/generate-string input))
-
+  (if (map? input)
+    [(json/generate-string input)]
+    (mapv json/generate-string input)))
 
 (defn printerr
   "Print the received input to stderr"
-  [input]
+  [& input]
   (binding [*out* *err*]
-    (println input)))
-
+    (apply prn input)))
 
 (defn printout
   "Print the received input to stdout"
   [input]
-  (println input))
-
+  (doseq [i input]
+    (println i)))
 
 (defn reply
   ([src dest body]
