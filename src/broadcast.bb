@@ -61,7 +61,8 @@
           (mapv
            #(reply @node-id
                    %
-                   broadcast-int-msg)
+                   (assoc broadcast-int-msg
+                          :msg_id (next-message-id)))
            neighbors))
          (reply @node-id
                 src
@@ -91,7 +92,7 @@
                 src
                 (assoc r-body
                        :type "broadcast_int_ok"
-                       :in_reply_to broadcast_id
+                       :in_reply_to (:msg_id body)
                        :msg_id (next-message-id)))))
       "broadcast_int_ok"
       (let [{:keys [:in_reply_to]} body]
