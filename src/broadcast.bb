@@ -47,14 +47,14 @@
             neighbors (set (get @topology (keyword @node-id) []))
             message (:message body)
             broadcast-int-msg {:type "broadcast_int"
-                               :msg_id broadcast-id
-                               :broadcast_id broadcast-id
+                               :broadcast_id [src broadcast-id]
                                :known [@node-id]
                                :message message}]
         (swap! seen conj message)
         (when (seq neighbors)
           (swap! pending assoc broadcast-id {:to neighbors
                                              :msg broadcast-int-msg}))
+        (printerr "pending >>>>>>>>>>> " @pending)
         (conj
          (concat
           (retry-pending)
