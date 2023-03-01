@@ -46,3 +46,9 @@
    {:src src
     :dest dest
     :body body}))
+
+(defn send!
+  [msg]
+  (-> msg
+      json/generate-string
+      println))
