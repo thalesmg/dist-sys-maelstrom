@@ -7,11 +7,26 @@
 (def message-id (atom 0))
 (def seen (atom #{}))
 (def topology (atom {}))
-(def pending (atom {}))
+(def pending
+  "{broadcast-id {:msg msg
+                  :to #{node-id}}}"
+  (atom {}))
 
 (defn next-message-id
   []
   (swap! message-id inc))
+
+(defn retry-pending
+  []
+  (->> @pending
+       vals
+       (mapcat (fn [{:keys [:msg :to] :as all}]
+                 (mapv #(reply @node-id
+                               %
+                               (assoc msg
+                                      :msg_id (next-message-id)
+                                      :retry true))
+                       to)))))
 
 (defn process-request
   [input]
@@ -29,54 +44,59 @@
                (assoc r-body :type "init_ok")))
       "broadcast"
       (let [broadcast-id (next-message-id)
-            neighbors (get @topology (keyword @node-id) [])
-            message (:message body)]
+            neighbors (set (get @topology (keyword @node-id) []))
+            message (:message body)
+            broadcast-int-msg {:type "broadcast_int"
+                               :msg_id broadcast-id
+                               :broadcast_id broadcast-id
+                               :known [@node-id]
+                               :message message}]
         (swap! seen conj message)
         (when (seq neighbors)
           (swap! pending assoc broadcast-id {:to neighbors
-                                             :msg message}))
+                                             :msg broadcast-int-msg}))
         (conj
-         (mapv
-          #(reply @node-id
-                  %
-                  {:type "broadcast_int"
-                   :msg_id broadcast-id
-                   :broadcast_id broadcast-id
-                   :known [@node-id]
-                   :message message})
-          neighbors)
+         (concat
+          (retry-pending)
+          (mapv
+           #(reply @node-id
+                   %
+                   broadcast-int-msg)
+           neighbors))
          (reply @node-id
                 src
                 (assoc r-body
                        :type "broadcast_ok"))))
       "broadcast_int"
       (let [{:keys [:known :message :broadcast_id]} body
+            message-to-save (dissoc body :retry)
             known (set known)
             neighbors (-> @topology
                           (get (keyword @node-id) [])
-                          (->> (filter #(not (known %)))))]
+                          (->> (filter #(not (known %))))
+                          set)]
         (swap! seen conj message)
         (when (seq neighbors)
           (swap! pending assoc broadcast_id {:to neighbors
-                                             :msg message}))
+                                             :msg message-to-save}))
         (conj
          (mapv
           #(reply @node-id
                   %
-                  {:type "broadcast_int"
-                   :msg_id (next-message-id)
-                   :known (conj known @node-id)
-                   :message message})
+                  (assoc message-to-save
+                         :msg_id (next-message-id)
+                         :known (conj known @node-id)))
           neighbors)
          (reply @node-id
                 src
                 (assoc r-body
                        :type "broadcast_int_ok"
+                       :in_reply_to broadcast_id
                        :msg_id (next-message-id)))))
       "broadcast_int_ok"
       (let [{:keys [:in_reply_to]} body]
         (swap! pending (fn [pending in-reply-to src]
-                         (let [{:keys [:to] :as p} (get pending in-reply-to)
+                         (let [{:keys [:to]} (get pending in-reply-to)
                                remaining (disj to src)]
                            (if (seq remaining)
                              (assoc-in pending [in-reply-to :to] remaining)
@@ -84,11 +104,13 @@
                in_reply_to src)
         [])
       "read"
-      (reply @node-id
-             src
-             (assoc r-body
-                    :type "read_ok"
-                    :messages @seen))
+      (conj
+       (retry-pending)
+       (reply @node-id
+              src
+              (assoc r-body
+                     :type "read_ok"
+                     :messages @seen)))
       "topology"
       (do
         (reset! topology (:topology body))
