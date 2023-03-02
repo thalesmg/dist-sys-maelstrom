@@ -20,23 +20,11 @@
   []
   (future
    (loop []
-     (doseq [{:keys [:msg :to]} (vals @pending)
-             dest to]
-       (send! (reply @node-id
-                     dest
-                     (assoc msg
-                            :msg_id (next-message-id)))))
+     (doseq [[[broadcast-id neighbor] broadcast-msg] @pending]
+       (send! (assoc-in broadcast-msg
+                        [:body :msg_id] (next-message-id))))
      (Thread/sleep 1000)
-     (recur)
-     #_(->> @pending
-            vals
-            (mapcat (fn [{:keys [:msg :to] :as all}]
-                      (mapv #(reply @node-id
-                                    %
-                                    (assoc msg
-                                           :msg_id (next-message-id)
-                                           :retry true))
-                            to)))))))
+     (recur))))
 
 (defn process-request
   [input]
@@ -50,78 +38,48 @@
       (do
         (reset! node-id (:node_id body))
         (reply @node-id
-               (:src input)
+               src
                (assoc r-body :type "init_ok")))
+
       "broadcast"
-      (let [broadcast-id (:msg_id body)
+      (let [broadcast-id (or (:broadcast_id body)
+                             [@node-id (next-message-id)])
+            gossip? (:broadcast_id body)
             neighbors (set (get @topology (keyword @node-id) []))
             message (:message body)
-            broadcast-int-msg {:type "broadcast_int"
-                               :broadcast_id broadcast-id
-                               :known [@node-id]
-                               :message message}]
-        (swap! seen conj message)
-        (when (seq neighbors)
-          (swap! pending assoc broadcast-id {:to neighbors
-                                             :msg broadcast-int-msg}))
-        (conj
-         (mapv
-          #(reply @node-id
-                  %
-                  (assoc broadcast-int-msg
-                         :msg_id (next-message-id)))
-          neighbors)
-         (reply @node-id
-                src
-                (assoc r-body
-                       :type "broadcast_ok"))))
-      "broadcast_int"
-      (let [{:keys [:known :message :broadcast_id]} body
-            message-to-save (dissoc body :retry)
-            known (set known)
-            neighbors (-> @topology
-                          (get (keyword @node-id) [])
-                          (->> (filter #(not (known %))))
-                          set)]
-        (printerr "broadcast int >>>>>>>>>>> " {:pending @pending
-                                                :body body
-                                                :neighbors neighbors})
-        (swap! seen conj message)
-        (when (seq neighbors)
-          (swap! pending assoc broadcast_id {:to neighbors
-                                             :msg message-to-save}))
-        (conj
-         (mapv
-          #(reply @node-id
-                  %
-                  (assoc message-to-save
-                         :msg_id (next-message-id)
-                         :known (conj known @node-id)))
-          neighbors)
-         (reply @node-id
-                src
-                (assoc r-body
-                       :type "broadcast_int_ok"
-                       :broadcast_id broadcast_id
-                       :msg_id (next-message-id)))))
-      "broadcast_int_ok"
-      (let [{:keys [:broadcast_id]} body]
-        (printerr "broadcast int ok >>>>>>>>>>> " {:pending @pending
-                                                   :body body})
-        (swap! pending (fn [pending broadcast-id src]
-                         (let [{:keys [:to]} (get pending broadcast-id)
-                               remaining (disj to src)]
-                           (if (seq remaining)
-                             (assoc-in pending [broadcast-id :to] remaining)
-                             (dissoc pending broadcast-id))))
-               broadcast_id src)
+            new? (not (@seen message))]
+        (when new?
+          (swap! seen conj message)
+          (doseq [neighbor neighbors]
+            (let [broadcast-msg (reply @node-id
+                                       neighbor
+                                       (assoc body
+                                              :broadcast_id broadcast-id))]
+              (swap! pending assoc [broadcast-id neighbor] broadcast-msg)
+              (send! broadcast-msg))))
+        (if gossip?
+          (reply @node-id
+                 src
+                 (assoc r-body
+                        :type "broadcast_ok"
+                        :broadcast_id broadcast-id))
+          (reply @node-id
+                 src
+                 (assoc r-body
+                        :type "broadcast_ok"))))
+
+      "broadcast_ok"
+      (let [broadcast-id (:broadcast_id body)]
+        (swap! pending dissoc [broadcast-id src])
         [])
+
       "read"
       (reply @node-id
              src
              (assoc r-body
                     :type "read_ok"
                     :messages @seen))
+
       "topology"
       (do
         (reset! topology (:topology body))
@@ -136,8 +94,11 @@
   [& args]
   (retry-pending-loop)
   (process-stdin #(-> %
+                      ;; (inspect :in-raw)
                       parse-json
+                      ;; (inspect :in)
                       process-request
+                      ;; (inspect :out-rep)
                       generate-json
                       printout)))
 

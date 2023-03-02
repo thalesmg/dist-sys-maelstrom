@@ -35,6 +35,11 @@
   (binding [*out* *err*]
     (apply prn input)))
 
+(defn inspect
+  [x label]
+  (printerr label ">>>>>>>>>>>>>>>>>" x)
+  x)
+
 (defn printout
   "Print the received input to stdout"
   [input]
@@ -50,5 +55,6 @@
 (defn send!
   [msg]
   (-> msg
+      ;; (inspect :out)
       json/generate-string
       println))
