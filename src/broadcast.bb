@@ -50,7 +50,8 @@
             new? (not (@seen message))]
         (when new?
           (swap! seen conj message)
-          (doseq [neighbor neighbors]
+          (doseq [neighbor neighbors
+                  :when (not= neighbor src)]
             (let [broadcast-msg (reply @node-id
                                        neighbor
                                        (assoc body
