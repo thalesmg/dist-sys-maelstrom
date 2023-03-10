@@ -5,6 +5,8 @@ Mix.install([:jason])
 defmodule Broadcast do
   use GenServer
 
+  @retry_interval 1_000
+
   def start_link() do
     GenServer.start_link(__MODULE__, nil, name: __MODULE__)
   end
@@ -52,18 +54,28 @@ defmodule Broadcast do
   end
   def handle_cast({:msg, %{"body" => %{"type" => "broadcast"} = body} = msg}, state) do
     IO.inspect(:stderr, msg, label: "got broadcast")
+    broadcast_id = msg["body"]["msg_id"]
     e = msg["body"]["message"]
     state = if :sets.is_element(e, state.messages) do
       state
     else
-      Enum.each(state.neighbors, fn n ->
+      Enum.reduce(state.neighbors, state, fn n, state ->
         if n != msg["src"] do
           send!(state.node_id, n, body)
+          pending_key = {n, broadcast_id}
+          start_retry_timer(pending_key)
+          Map.update!(state, :pending, &Map.put(&1, pending_key, body))
+        else
+          state
         end
       end)
       Map.update!(state, :messages, &:sets.add_element(e, &1))
     end
-    reply!(state.node_id, msg, %{type: "broadcast_ok"})
+    if msg["src"] in state.neighbors do
+      reply!(state.node_id, msg, %{type: "broadcast_ok", broadcast_id: broadcast_id})
+    else
+      reply!(state.node_id, msg, %{type: "broadcast_ok"})
+    end
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "broadcast_ok"}} = msg}, state) do
@@ -71,7 +83,20 @@ defmodule Broadcast do
     {:noreply, state}
   end
 
-  def reply!(from, original_msg, body) do
+  def handle_info({:retry, pending_key = {n, _broadcast_id}}, state) do
+    IO.inspect(:stderr, pending_key, label: "gonna retry?")
+    IO.inspect(:stderr, state, label: "gonna retry? state>>")
+    with {:ok, body} <- Map.fetch(state.pending, pending_key) do
+      IO.inspect(:stderr, pending_key, label: "retrying...")
+      send!(state.node_id, n, body)
+      start_retry_timer(pending_key)
+    else
+      _ -> IO.inspect(:stderr, pending_key, label: "removed")
+    end
+    {:noreply, state}
+  end
+
+  defp reply!(from, original_msg, body) do
     body = Map.merge(
       body,
       %{
@@ -97,6 +122,10 @@ defmodule Broadcast do
         Process.put(:msg_id, n + 1)
         n
     end
+  end
+
+  defp start_retry_timer(pending_key) do
+    Process.send_after(self(), {:retry, pending_key}, @retry_interval)
   end
 end
 
