@@ -46,19 +46,19 @@ defmodule GCounter do
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "add"}} = msg}, state) do
+    log(msg, "got add req")
     delta = msg["body"]["delta"]
-    state = %{state | x: state.x + delta}
-    # kv_write!(state.node_id, state.x, state)
-    state = bump_vsn(state)
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x - delta, state.x, state)
-    state = put_in(state, [:pending, msg_id], {:add, delta})
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
+    state = put_in(state, [:pending, msg_id], {:add, delta, state.x})
     reply!(state.node_id, msg, %{type: "add_ok"})
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "read"}} = msg}, state) do
     log(msg, "got read req")
     orig_msg_id = msg["body"]["msg_id"]
-    %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
+    # using a cas to "assert" our view of the value
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
+    # %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
     state =
       state
       |> put_in([:pending, msg_id], {:read, orig_msg_id})
@@ -71,12 +71,16 @@ defmodule GCounter do
     val = msg["body"]["value"]
     case pop_in(state, [:pending, in_reply_to]) do
       {{:read, orig_msg_id}, state} ->
-        handle_read_reply(state, orig_msg_id, val)
+        # cas again; only reply in cas_ok when it's up to date.
+        state = %{state | x: val}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, val, val, state)
+        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        {:noreply, state}
 
       {{:sync, delta}, state} ->
-        state = %{state | x: max(state.x, val) + delta}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x - delta, state.x, state)
-        state = put_in(state, [:pending, msg_id], {:add, delta})
+        state = %{state | x: val}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
+        state = put_in(state, [:pending, msg_id], {:add, delta, val})
         {:noreply, state}
     end
   end
@@ -87,24 +91,40 @@ defmodule GCounter do
   def handle_cast({:msg, %{"body" => %{"type" => "cas_ok"}} = msg}, state) do
     log(msg, "seq-kv cas_ok")
     in_reply_to = msg["body"]["in_reply_to"]
-    {_, state} = pop_in(state, [:pending, in_reply_to])
-    {:noreply, state}
+    case pop_in(state, [:pending, in_reply_to]) do
+      {{:read, orig_msg_id}, state} ->
+        # synchronized view; reply
+        handle_read_reply(state, orig_msg_id, state.x)
+
+      {{:add, delta, val}, state} ->
+        # added successfully; just drop and set the state
+        state = %{state | x: val}
+        {:noreply, state}
+    end
   end
   def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 22, "in_reply_to" => orig_msg_id}} = msg}, state) do
-    log(msg, "seq-kv write error")
-    # retry(msg)
-    {:noreply, state}
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 20}} = msg}, state) do
-    log(msg, "seq-kv read or cas error")
+    log(msg, "seq-kv write or cas error (stale view)")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:add, delta}, state} ->
+      {{:add, delta, old_val}, state} ->
         # sync
         %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
         state = put_in(state, [:pending, msg_id], {:sync, delta})
         {:noreply, state}
 
+      {{:read, orig_msg_id}, state} ->
+        # read current value and try again
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
+        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        {:noreply, state}
+    end
+  end
+  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 20}} = msg}, state) do
+    log(msg, "seq-kv read or cas error (key doesn't exist)")
+    # this can only be the response to a read, since we're using
+    # "create-if-not-exists" during cas operations.
+    in_reply_to = msg["body"]["in_reply_to"]
+    case pop_in(state, [:pending, in_reply_to]) do
       {{:read, orig_msg_id}, state} ->
         val = 0
         handle_read_reply(state, orig_msg_id, val)
@@ -112,46 +132,11 @@ defmodule GCounter do
   end
 
   defp handle_read_reply(state, orig_msg_id, val) do
-    state = Map.update!(state, :x, &max(&1, val))
+    state = Map.put(state, :x, val)
     {%{orig_msg: orig_msg}, state} = pop_in(state, [:pending, orig_msg_id])
-    body = %{type: "read_ok", value: state.x}
+    body = %{type: "read_ok", value: val}
     reply!(state.node_id, orig_msg, body)
     {:noreply, state}
-  end
-
-  defp maybe_reply_read(state, in_reply_to, val, orig_msg_id) do
-    %{pending_replies: p, orig_msg: orig_msg, x: x} = state.pending[orig_msg_id]
-    p = MapSet.delete(p, in_reply_to)
-    if MapSet.size(p) == 0 do
-      log(x + val, "#{orig_msg_id} is done, replying")
-      body = %{type: "read_ok", value: x + val}
-      reply!(state.node_id, orig_msg, body)
-      {_, state} = pop_in(state, [:pending, orig_msg_id])
-      state
-    else
-      log(p, "remaining for #{orig_msg_id}")
-      update_in(state, [:pending, orig_msg_id], fn old ->
-        old
-        |> Map.put(:pending_replies, p)
-        |> Map.update!(:x, & &1 + val)
-      end)
-    end
-  end
-
-  defp bump_vsn(state) do
-    bump_vsn(state, state.vsn)
-  end
-
-  defp bump_vsn(state, curr_val) do
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@kv_vsn, curr_val, curr_val + 1, state)
-    state
-    |> Map.put(:vsn, curr_val + 1)
-    |> put_in([:pending, msg_id], :bump_vsn)
-  end
-
-  defp read_vsn(state) do
-    %{body: %{"msg_id" => msg_id}} = kv_read!(@kv_vsn, state)
-    put_in(state, [:pending, msg_id], :read_vsn)
   end
 
   defp reply!(from, original_msg, body) do
