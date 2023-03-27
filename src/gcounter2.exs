@@ -6,6 +6,7 @@ defmodule GCounter do
   use GenServer
 
   @retry_interval 500
+  @vsn "vsn"
   @val "value"
 
   def start_link() do
@@ -82,6 +83,18 @@ defmodule GCounter do
         %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
         state = put_in(state, [:pending, msg_id], {:add, delta, val})
         {:noreply, state}
+
+      {:read_vsn, state} ->
+        state = %{state | vsn: val}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, state.vsn})
+        {:noreply, state}
+
+      {{:read_retry, orig_msg_id}, state} ->
+        state = %{state | vsn: val}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
+        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        {:noreply, state}
     end
   end
   def handle_cast({:msg, %{"body" => %{"type" => "write_ok"}} = msg}, state) do
@@ -93,12 +106,24 @@ defmodule GCounter do
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
       {{:read, orig_msg_id}, state} ->
+        # synchronized view; assert version
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
+        state = put_in(state, [:pending, msg_id], {:read_reply, orig_msg_id})
+        {:noreply, state}
+
+      {{:read_reply, orig_msg_id}, state} ->
         # synchronized view; reply
         handle_read_reply(state, orig_msg_id, state.x)
 
       {{:add, delta, old_val}, state} ->
         # added successfully; just drop and "commit" the state
         state = %{state | x: old_val + delta}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, state.vsn})
+        {:noreply, state}
+
+      {{:bump, old_vsn}, state} ->
+        state = %{state | vsn: old_vsn + 1}
         {:noreply, state}
     end
   end
@@ -116,6 +141,18 @@ defmodule GCounter do
         # read current value and try again
         %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
         state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        {:noreply, state}
+
+      {{:read_reply, orig_msg_id}, state} ->
+        # read current value and try again from the start
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
+        state = put_in(state, [:pending, msg_id], {:read_retry, orig_msg_id})
+        {:noreply, state}
+
+      {{:bump, old_vsn}, state} ->
+        state = %{state | vsn: old_vsn + 1}
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
+        state = put_in(state, [:pending, msg_id], :read_vsn)
         {:noreply, state}
     end
   end
