@@ -96,9 +96,9 @@ defmodule GCounter do
         # synchronized view; reply
         handle_read_reply(state, orig_msg_id, state.x)
 
-      {{:add, delta, val}, state} ->
-        # added successfully; just drop and set the state
-        state = %{state | x: val}
+      {{:add, delta, old_val}, state} ->
+        # added successfully; just drop and "commit" the state
+        state = %{state | x: old_val + delta}
         {:noreply, state}
     end
   end
