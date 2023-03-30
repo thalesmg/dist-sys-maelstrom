@@ -49,8 +49,11 @@ defmodule GCounter do
   def handle_cast({:msg, %{"body" => %{"type" => "add"}} = msg}, state) do
     log(msg, "got add req")
     delta = msg["body"]["delta"]
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
-    state = put_in(state, [:pending, msg_id], {:add, delta, state.x})
+    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
+    # state = put_in(state, [:pending, msg_id], {:add, delta, state.x})
+
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+    state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
     reply!(state.node_id, msg, %{type: "add_ok"})
     {:noreply, state}
   end
@@ -58,12 +61,19 @@ defmodule GCounter do
     log(msg, "got read req")
     orig_msg_id = msg["body"]["msg_id"]
     # using a cas to "assert" our view of the value
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
-    # %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
+    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
+    # state =
+    #   state
+    #   |> put_in([:pending, msg_id], {:read, orig_msg_id})
+    #   |> put_in([:pending, orig_msg_id], %{orig_msg: msg})
+
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+    orig_key = {:orig, orig_msg_id}
     state =
       state
-      |> put_in([:pending, msg_id], {:read, orig_msg_id})
-      |> put_in([:pending, orig_msg_id], %{orig_msg: msg})
+      |> put_in([:pending, msg_id], {:bump, {:read, orig_key}})
+      |> put_in([:pending, orig_key], %{orig_msg: msg})
+
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "read_ok"}} = msg}, state) do
@@ -71,29 +81,15 @@ defmodule GCounter do
     in_reply_to = msg["body"]["in_reply_to"]
     val = msg["body"]["value"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_msg_id}, state} ->
+      {{:read, orig_key}, state} ->
         # cas again; only reply in cas_ok when it's up to date.
         state = %{state | x: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, val, val, state)
-        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
-        {:noreply, state}
+        handle_read_reply(state, orig_key, state.x)
 
-      {{:sync, delta}, state} ->
-        state = %{state | x: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
-        state = put_in(state, [:pending, msg_id], {:add, delta, val})
-        {:noreply, state}
-
-      {:read_vsn, state} ->
+      {{:read_vsn, next_action}, state} ->
         state = %{state | vsn: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.vsn, state.vsn + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump, state.vsn})
-        {:noreply, state}
-
-      {{:read_retry, orig_msg_id}, state} ->
-        state = %{state | vsn: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
-        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, next_action})
         {:noreply, state}
     end
   end
@@ -105,25 +101,18 @@ defmodule GCounter do
     log(msg, "seq-kv cas_ok")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_msg_id}, state} ->
-        # synchronized view; assert version
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
-        state = put_in(state, [:pending, msg_id], {:read_reply, orig_msg_id})
-        {:noreply, state}
+      {{:read, orig_key}, state} ->
+        # synchronized view
+        handle_read_reply(state, orig_key, state.x)
 
-      {{:read_reply, orig_msg_id}, state} ->
-        # synchronized view; reply
-        handle_read_reply(state, orig_msg_id, state.x)
-
-      {{:add, delta, old_val}, state} ->
+      {{:add, delta}, state} ->
         # added successfully; just drop and "commit" the state
-        state = %{state | x: old_val + delta}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump, state.vsn})
+        state = %{state | x: state.x + delta}
         {:noreply, state}
 
-      {{:bump, old_vsn}, state} ->
-        state = %{state | vsn: old_vsn + 1}
+      {{:bump, next_action}, state} ->
+        state = %{state | vsn: state.vsn + 1}
+        state = handle_next_action(state, next_action)
         {:noreply, state}
     end
   end
@@ -131,28 +120,23 @@ defmodule GCounter do
     log(msg, "seq-kv write or cas error (stale view)")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:add, delta, old_val}, state} ->
+      {{:add, delta}, state} ->
         # sync
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
-        state = put_in(state, [:pending, msg_id], {:sync, delta})
+        state = %{state | vsn: state.vsn + 1}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
         {:noreply, state}
 
-      {{:read, orig_msg_id}, state} ->
+      {{:read, orig_key}, state} ->
         # read current value and try again
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
-        state = put_in(state, [:pending, msg_id], {:read, orig_msg_id})
+        state = %{state | vsn: state.vsn + 1}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, {:read, orig_key}})
         {:noreply, state}
 
-      {{:read_reply, orig_msg_id}, state} ->
-        # read current value and try again from the start
+      {{:bump, next_action}, state} ->
         %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
-        state = put_in(state, [:pending, msg_id], {:read_retry, orig_msg_id})
-        {:noreply, state}
-
-      {{:bump, old_vsn}, state} ->
-        state = %{state | vsn: old_vsn + 1}
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
-        state = put_in(state, [:pending, msg_id], :read_vsn)
+        state = put_in(state, [:pending, msg_id], {:read_vsn, next_action})
         {:noreply, state}
     end
   end
@@ -174,6 +158,16 @@ defmodule GCounter do
     body = %{type: "read_ok", value: val}
     reply!(state.node_id, orig_msg, body)
     {:noreply, state}
+  end
+
+  defp handle_next_action(state, {:add, delta}) do
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
+    put_in(state, [:pending, msg_id], {:add, delta})
+  end
+  defp handle_next_action(state, {:read, orig_key}) do
+    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
+    %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
+    put_in(state, [:pending, msg_id], {:read, orig_key})
   end
 
   defp reply!(from, original_msg, body) do
