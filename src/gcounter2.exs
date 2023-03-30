@@ -97,11 +97,16 @@ defmodule GCounter do
       {{:add, delta}, state} ->
         # added successfully; just drop and "commit" the state
         state = %{state | x: state.x + delta}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
+        state = put_in(state, [:pending, msg_id], :assert_vsn)
         {:noreply, state}
 
       {{:bump, next_action}, state} ->
         state = %{state | vsn: state.vsn + 1}
         state = handle_next_action(state, next_action)
+        {:noreply, state}
+
+      {:assert_vsn, state} ->
         {:noreply, state}
     end
   end
@@ -126,6 +131,11 @@ defmodule GCounter do
       {{:bump, next_action}, state} ->
         %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
         state = put_in(state, [:pending, msg_id], {:read_vsn, next_action})
+        {:noreply, state}
+
+      {:assert_vsn, state} ->
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
+        state = put_in(state, [:pending, msg_id], {:read_vsn, :assert_vsn})
         {:noreply, state}
     end
   end
@@ -156,6 +166,10 @@ defmodule GCounter do
   defp handle_next_action(state, {:read, orig_key}) do
     %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
     put_in(state, [:pending, msg_id], {:read, orig_key})
+  end
+  defp handle_next_action(state, :assert_vsn) do
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
+    state = put_in(state, [:pending, msg_id], :assert_vsn)
   end
 
   defp reply!(from, original_msg, body) do
