@@ -6,7 +6,8 @@ defmodule GCounter do
   use GenServer
 
   @retry_interval 500
-  @kv_vsn "vsn"
+  @vsn "vsn"
+  @val "value"
 
   def start_link() do
     GenServer.start_link(__MODULE__, nil, name: __MODULE__)
@@ -41,36 +42,27 @@ defmodule GCounter do
   def handle_cast({:msg, %{"body" => %{"type" => "init"}} = msg}, state) do
     log(msg, "got init")
     state = %{state | node_id: msg["body"]["node_id"], nodes: msg["body"]["node_ids"]}
-    kv_write!(state.node_id, 0, state)
     reply!(state.node_id, msg, %{type: "init_ok"})
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "add"}} = msg}, state) do
+    log(msg, "got add req")
     delta = msg["body"]["delta"]
-    state = %{state | x: state.x + delta}
-    # kv_write!(state.node_id, state.x, state)
-    state = bump_vsn(state)
-    kv_cas!(state.node_id, state.x - delta, state.x, state)
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+    state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
     reply!(state.node_id, msg, %{type: "add_ok"})
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "read"}} = msg}, state) do
     log(msg, "got read req")
     orig_msg_id = msg["body"]["msg_id"]
-    pending =
-      state.nodes
-      # |> Stream.filter(& &1 != state.node_id)
-      |> Enum.reduce(state.pending, fn n, acc ->
-        %{body: %{"msg_id" => msg_id}} = kv_read!(n, state)
-        acc
-        # |> Map.update(orig_msg_id, %{pending: MapSet.new([msg_id]), orig_msg: msg, x: state.x}, fn old ->
-        |> Map.update(orig_msg_id, %{pending_replies: MapSet.new([msg_id]), orig_msg: msg, x: 0}, fn old ->
-          Map.update!(old, :pending_replies, &MapSet.put(&1, msg_id))
-        end)
-        |> Map.put(msg_id, {:read, orig_msg_id})
-      end)
-    state = %{state | pending: pending}
-    # reply!(state.node_id, msg, %{type: "read_ok", value: -1})
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+    orig_key = {:orig, orig_msg_id}
+    state =
+      state
+      |> put_in([:pending, msg_id], {:bump, {:read, orig_key}})
+      |> put_in([:pending, orig_key], %{orig_msg: msg})
+
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "read_ok"}} = msg}, state) do
@@ -78,11 +70,19 @@ defmodule GCounter do
     in_reply_to = msg["body"]["in_reply_to"]
     val = msg["body"]["value"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_msg_id}, state} ->
-        handle_read_reply(state, orig_msg_id, in_reply_to, val)
+      {{:read, orig_key}, state} ->
+        state = %{state | x: max(val, state.x)}
+        # assert the version so that we try again if there were
+        # concurrent updates
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
+        state = put_in(state, [:pending, msg_id], {:assert_vsn, {:read, orig_key}, {:finalize_read, orig_key}})
+        {:noreply, state}
 
-      {:read_vsn, state} ->
-        bump_vsn(state, val)
+      {{:read_vsn, next_action}, state} ->
+        state = %{state | vsn: val}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, next_action})
+        {:noreply, state}
     end
   end
   def handle_cast({:msg, %{"body" => %{"type" => "write_ok"}} = msg}, state) do
@@ -91,89 +91,87 @@ defmodule GCounter do
   end
   def handle_cast({:msg, %{"body" => %{"type" => "cas_ok"}} = msg}, state) do
     log(msg, "seq-kv cas_ok")
-    {:noreply, state}
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 22, "in_reply_to" => orig_msg_id}} = msg}, state) do
-    log(msg, "seq-kv write error")
-    # retry(msg)
-    {:noreply, state}
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 20}} = msg}, state) do
-    log(msg, "seq-kv read or cas error?")
-    # retry(msg)
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {:bump_vsn, state} ->
-        state = read_vsn(state)
+      {{:add, delta}, state} ->
+        # added successfully; just drop and "commit" the state
+        state = %{state | x: state.x + delta}
         {:noreply, state}
 
-      {:read_vsn, state} ->
-        state = read_vsn(state)
+      {{:bump, next_action}, state} ->
+        state = %{state | vsn: state.vsn + 1}
+        state = handle_next_action(state, next_action)
         {:noreply, state}
 
+      {{:assert_vsn, retry_action, next_action}, state} ->
+        state = handle_next_action(state, next_action)
+        {:noreply, state}
+    end
+  end
+  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 22, "in_reply_to" => orig_msg_id}} = msg}, state) do
+    log(msg, "seq-kv write or cas error (stale view)")
+    in_reply_to = msg["body"]["in_reply_to"]
+    case pop_in(state, [:pending, in_reply_to]) do
+      {{:add, delta}, state} ->
+        # sync
+        state = %{state | vsn: state.vsn + 1}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
+        {:noreply, state}
+
+      {{:read, orig_key}, state} ->
+        # read current value and try again
+        state = %{state | vsn: state.vsn + 1}
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump, {:read, orig_key}})
+        {:noreply, state}
+
+      {{:bump, next_action}, state} ->
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
+        state = put_in(state, [:pending, msg_id], {:read_vsn, next_action})
+        {:noreply, state}
+
+      {{:assert_vsn, retry_action, next_action}, state} ->
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
+        state = put_in(state, [:pending, msg_id], {:read_vsn, retry_action})
+        {:noreply, state}
+    end
+  end
+  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 20}} = msg}, state) do
+    log(msg, "seq-kv read or cas error (key doesn't exist)")
+    # this can only be the response to a read, since we're using
+    # "create-if-not-exists" during cas operations.
+    in_reply_to = msg["body"]["in_reply_to"]
+    case pop_in(state, [:pending, in_reply_to]) do
       {{:read, orig_msg_id}, state} ->
         val = 0
-        handle_read_reply(state, orig_msg_id, in_reply_to, val)
+        handle_read_reply(state, orig_msg_id, val)
     end
   end
-  ## internal msgs
-  # def handle_cast({:add, x}, state) do
-  #   log(x, "add")
 
-  #   {:noreply, state}
-  # end
-
-  def handle_info({:retry, pending_key = {n, _broadcast_id}}, state) do
-    log(pending_key, "gonna retry?")
-    log(state, "gonna retry? state>>")
-    with {:ok, body} <- Map.fetch(state.pending, pending_key) do
-      log(pending_key, "retrying...")
-      send!(state.node_id, n, body)
-      start_retry_timer(pending_key)
-    else
-      _ -> log(pending_key, "removed")
-    end
+  defp handle_read_reply(state, orig_msg_id, val) do
+    {%{orig_msg: orig_msg}, state} = pop_in(state, [:pending, orig_msg_id])
+    body = %{type: "read_ok", value: val}
+    reply!(state.node_id, orig_msg, body)
     {:noreply, state}
   end
 
-  defp handle_read_reply(state, orig_msg_id, in_reply_to, val) do
-    state = maybe_reply_read(state, in_reply_to, val, orig_msg_id)
-    {:noreply, state}
+  defp handle_next_action(state, {:add, delta}) do
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
+    put_in(state, [:pending, msg_id], {:add, delta})
   end
-
-  defp maybe_reply_read(state, in_reply_to, val, orig_msg_id) do
-    %{pending_replies: p, orig_msg: orig_msg, x: x} = state.pending[orig_msg_id]
-    p = MapSet.delete(p, in_reply_to)
-    if MapSet.size(p) == 0 do
-      log(x + val, "#{orig_msg_id} is done, replying")
-      body = %{type: "read_ok", value: x + val}
-      reply!(state.node_id, orig_msg, body)
-      {_, state} = pop_in(state, [:pending, orig_msg_id])
-      state
-    else
-      log(p, "remaining for #{orig_msg_id}")
-      update_in(state, [:pending, orig_msg_id], fn old ->
-        old
-        |> Map.put(:pending_replies, p)
-        |> Map.update!(:x, & &1 + val)
-      end)
-    end
+  defp handle_next_action(state, {:read, orig_key}) do
+    %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
+    put_in(state, [:pending, msg_id], {:read, orig_key})
   end
-
-  defp bump_vsn(state) do
-    bump_vsn(state, state.vsn)
+  defp handle_next_action(state, {:assert_vsn, retry_action, next_action}) do
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
+    state = put_in(state, [:pending, msg_id], {:assert_vsn, retry_action, next_action})
   end
-
-  defp bump_vsn(state, curr_val) do
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@kv_vsn, curr_val, curr_val + 1, state)
+  defp handle_next_action(state, {:finalize_read, orig_key}) do
+    # fixme
+    {:noreply, state} = handle_read_reply(state, orig_key, state.x)
     state
-    |> Map.put(:vsn, curr_val + 1)
-    |> put_in([:pending, msg_id], :bump_vsn)
-  end
-
-  defp read_vsn(state) do
-    %{body: %{"msg_id" => msg_id}} = kv_read!(@kv_vsn, state)
-    put_in(state, [:pending, msg_id], :read_vsn)
   end
 
   defp reply!(from, original_msg, body) do
