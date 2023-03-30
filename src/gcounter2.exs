@@ -90,10 +90,6 @@ defmodule GCounter do
     log(msg, "seq-kv cas_ok")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_key}, state} ->
-        # synchronized view
-        handle_read_reply(state, orig_key, state.x)
-
       {{:add, delta}, state} ->
         # added successfully; just drop and "commit" the state
         state = %{state | x: state.x + delta}
@@ -152,7 +148,6 @@ defmodule GCounter do
   end
 
   defp handle_read_reply(state, orig_msg_id, val) do
-    state = Map.put(state, :x, val)
     {%{orig_msg: orig_msg}, state} = pop_in(state, [:pending, orig_msg_id])
     body = %{type: "read_ok", value: val}
     reply!(state.node_id, orig_msg, body)
