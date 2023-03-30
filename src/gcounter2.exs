@@ -42,16 +42,12 @@ defmodule GCounter do
   def handle_cast({:msg, %{"body" => %{"type" => "init"}} = msg}, state) do
     log(msg, "got init")
     state = %{state | node_id: msg["body"]["node_id"], nodes: msg["body"]["node_ids"]}
-    # kv_write!(state.node_id, 0, state)
     reply!(state.node_id, msg, %{type: "init_ok"})
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "add"}} = msg}, state) do
     log(msg, "got add req")
     delta = msg["body"]["delta"]
-    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
-    # state = put_in(state, [:pending, msg_id], {:add, delta, state.x})
-
     %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
     state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
     reply!(state.node_id, msg, %{type: "add_ok"})
@@ -60,13 +56,6 @@ defmodule GCounter do
   def handle_cast({:msg, %{"body" => %{"type" => "read"}} = msg}, state) do
     log(msg, "got read req")
     orig_msg_id = msg["body"]["msg_id"]
-    # using a cas to "assert" our view of the value
-    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
-    # state =
-    #   state
-    #   |> put_in([:pending, msg_id], {:read, orig_msg_id})
-    #   |> put_in([:pending, orig_msg_id], %{orig_msg: msg})
-
     %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
     orig_key = {:orig, orig_msg_id}
     state =
@@ -165,7 +154,6 @@ defmodule GCounter do
     put_in(state, [:pending, msg_id], {:add, delta})
   end
   defp handle_next_action(state, {:read, orig_key}) do
-    # %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x, state)
     %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
     put_in(state, [:pending, msg_id], {:read, orig_key})
   end
