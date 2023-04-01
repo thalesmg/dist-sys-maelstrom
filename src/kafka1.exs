@@ -15,6 +15,12 @@ defmodule SparseSeq do
     %__MODULE__{}
   end
 
+  def new(ixs) do
+    Enum.reduce(ixs, new(), fn {i, x}, acc ->
+      insert(acc, i, x)
+    end)
+  end
+
   def insert(ss = %__MODULE__{}, i, x) do
     %{ss | n: ss.n + 1, is: Seq.snoc(ss.is, i), xs: Seq.snoc(ss.xs, x)}
   end
@@ -60,12 +66,7 @@ end
 defmodule Kafka do
   use GenServer
 
-  alias Hallux.OrderedMap, as: OM
-  alias Hallux.Seq
-
-  @retry_interval 500
-  @vsn "vsn"
-  @val "value"
+  alias SparseSeq, as: SS
 
   def start_link() do
     GenServer.start_link(__MODULE__, nil, name: __MODULE__)
@@ -81,8 +82,11 @@ defmodule Kafka do
 
   def init(nil) do
     state = %{
+      node_id: nil,
+      nodes: [],
       offset: 0,
       topics: %{},
+      committed: %{},
     }
     {:ok, state}
   end
@@ -104,145 +108,64 @@ defmodule Kafka do
     log(msg, "got send req")
     %{"key" => k, "msg" => v} = msg["body"]
     state = handle_send(state, k, v)
-    reply!(state.node_id, msg, %{type: "send_ok"})
+    reply!(state.node_id, msg, %{type: "send_ok", offset: state.offset - 1})
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "poll"}} = msg}, state) do
     log(msg, "got poll req")
-    offsets = Enum.reduce(msg["body"]["offsets"], %{}, fn {k, off}, acc ->
-      nil
+    offs = msg["body"]["offsets"]
+    offsets = Enum.reduce(offs, %{}, fn {topic, off}, acc ->
+      case Map.fetch(state.topics, topic) do
+        {:ok, offset} ->
+          os =
+            offset
+            |> SS.slice_at(off)
+            |> serialize_sparse()
+          Map.put(acc, topic, os)
+
+        :error ->
+          acc
+      end
     end)
-
-    reply!(state.node_id, msg, %{type: "send_ok"})
+    reply!(state.node_id, msg, %{type: "poll_ok", msgs: offsets})
     {:noreply, state}
   end
-  def handle_cast({:msg, %{"body" => %{"type" => "read"}} = msg}, state) do
-    log(msg, "got read req")
-    orig_msg_id = msg["body"]["msg_id"]
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
-    orig_key = {:orig, orig_msg_id}
-    state =
-      state
-      |> put_in([:pending, msg_id], {:bump, {:read, orig_key}})
-      |> put_in([:pending, orig_key], %{orig_msg: msg})
+  def handle_cast({:msg, %{"body" => %{"type" => "list_committed_offsets"}} = msg}, state) do
+    log(msg, "got list_committed_offsets req")
+    topics = msg["body"]["keys"]
+    offsets = Enum.reduce(topics, %{}, fn topic, acc ->
+      case Map.fetch(state.committed, topic) do
+        {:ok, o} ->
+          Map.put(acc, topic, o)
 
+        :error ->
+          acc
+      end
+    end)
+    reply!(state.node_id, msg, %{type: "list_committed_offsets_ok", offsets: offsets})
     {:noreply, state}
   end
-  def handle_cast({:msg, %{"body" => %{"type" => "read_ok"}} = msg}, state) do
-    log(msg, "seq-kv read_ok")
-    in_reply_to = msg["body"]["in_reply_to"]
-    val = msg["body"]["value"]
-    case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_key}, state} ->
-        state = %{state | x: max(val, state.x)}
-        # assert the version so that we try again if there were
-        # concurrent updates
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
-        state = put_in(state, [:pending, msg_id], {:assert_vsn, {:read, orig_key}, {:finalize_read, orig_key}})
-        {:noreply, state}
-
-      {{:read_vsn, next_action}, state} ->
-        state = %{state | vsn: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump, next_action})
-        {:noreply, state}
-    end
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "write_ok"}} = msg}, state) do
-    log(msg, "seq-kv write_ok")
+  def handle_cast({:msg, %{"body" => %{"type" => "commit_offsets"}} = msg}, state) do
+    log(msg, "got commit_offsets req")
+    offsets = msg["body"]["offsets"]
+    committed = Enum.reduce(offsets, state.committed, fn {topic, i}, acc ->
+      Map.update(acc, topic, i, &max(&1, i))
+    end)
+    state = %{state | committed: committed}
+    reply!(state.node_id, msg, %{type: "commit_offsets_ok"})
     {:noreply, state}
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "cas_ok"}} = msg}, state) do
-    log(msg, "seq-kv cas_ok")
-    in_reply_to = msg["body"]["in_reply_to"]
-    case pop_in(state, [:pending, in_reply_to]) do
-      {{:add, delta}, state} ->
-        # added successfully; just drop and "commit" the state
-        state = %{state | x: state.x + delta}
-        {:noreply, state}
-
-      {{:bump, next_action}, state} ->
-        state = %{state | vsn: state.vsn + 1}
-        state = handle_next_action(state, next_action)
-        {:noreply, state}
-
-      {{:assert_vsn, retry_action, next_action}, state} ->
-        state = handle_next_action(state, next_action)
-        {:noreply, state}
-    end
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 22, "in_reply_to" => orig_msg_id}} = msg}, state) do
-    log(msg, "seq-kv write or cas error (stale view)")
-    in_reply_to = msg["body"]["in_reply_to"]
-    case pop_in(state, [:pending, in_reply_to]) do
-      {{:add, delta}, state} ->
-        # sync
-        state = %{state | vsn: state.vsn + 1}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump, {:add, delta}})
-        {:noreply, state}
-
-      {{:read, orig_key}, state} ->
-        # read current value and try again
-        state = %{state | vsn: state.vsn + 1}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump, {:read, orig_key}})
-        {:noreply, state}
-
-      {{:bump, next_action}, state} ->
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
-        state = put_in(state, [:pending, msg_id], {:read_vsn, next_action})
-        {:noreply, state}
-
-      {{:assert_vsn, retry_action, next_action}, state} ->
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@vsn, state)
-        state = put_in(state, [:pending, msg_id], {:read_vsn, retry_action})
-        {:noreply, state}
-    end
-  end
-  def handle_cast({:msg, %{"body" => %{"type" => "error", "code" => 20}} = msg}, state) do
-    log(msg, "seq-kv read or cas error (key doesn't exist)")
-    # this can only be the response to a read, since we're using
-    # "create-if-not-exists" during cas operations.
-    in_reply_to = msg["body"]["in_reply_to"]
-    case pop_in(state, [:pending, in_reply_to]) do
-      {{:read, orig_msg_id}, state} ->
-        val = 0
-        handle_read_reply(state, orig_msg_id, val)
-    end
   end
 
   defp handle_send(state, k, v) do
     state
     |> Map.update!(:offset, & &1 + 1)
     |> Map.update!(:topics, fn old ->
-      Map.update(old, k, OM.new([{state.offset, v}]), & OM.insert(&1, state.offset, v))
+      Map.update(old, k, SS.new([{state.offset, v}]), & SS.insert(&1, state.offset, v))
     end)
   end
 
-  defp handle_read_reply(state, orig_msg_id, val) do
-    {%{orig_msg: orig_msg}, state} = pop_in(state, [:pending, orig_msg_id])
-    body = %{type: "read_ok", value: val}
-    reply!(state.node_id, orig_msg, body)
-    {:noreply, state}
-  end
-
-  defp handle_next_action(state, {:add, delta}) do
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@val, state.x, state.x + delta, state)
-    put_in(state, [:pending, msg_id], {:add, delta})
-  end
-  defp handle_next_action(state, {:read, orig_key}) do
-    %{body: %{"msg_id" => msg_id}} = kv_read!(@val, state)
-    put_in(state, [:pending, msg_id], {:read, orig_key})
-  end
-  defp handle_next_action(state, {:assert_vsn, retry_action, next_action}) do
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@vsn, state.vsn, state.vsn, state)
-    state = put_in(state, [:pending, msg_id], {:assert_vsn, retry_action, next_action})
-  end
-  defp handle_next_action(state, {:finalize_read, orig_key}) do
-    # fixme
-    {:noreply, state} = handle_read_reply(state, orig_key, state.x)
-    state
+  defp serialize_sparse(ss) do
+    Enum.zip_with(ss.is, ss.xs, & [&1, &2])
   end
 
   defp reply!(from, original_msg, body) do
@@ -254,34 +177,6 @@ defmodule Kafka do
       }
     )
     send!(from, original_msg["src"], body)
-  end
-
-  defp kv_read!(k, state) do
-    body = %{
-      type: "read",
-      key: k,
-    }
-    send!(state.node_id, "seq-kv", body)
-  end
-
-  defp kv_write!(k, v, state) do
-    body = %{
-      type: "write",
-      key: k,
-      value: v,
-    }
-    send!(state.node_id, "seq-kv", body)
-  end
-
-  defp kv_cas!(k, v0, v1, state) do
-    body = %{
-      type: "cas",
-      key: k,
-      from: v0,
-      to: v1,
-      create_if_not_exists: true,
-    }
-    send!(state.node_id, "seq-kv", body)
   end
 
   defp send!(from, to, body) do
@@ -302,10 +197,6 @@ defmodule Kafka do
         Process.put(:msg_id, n + 1)
         n
     end
-  end
-
-  defp start_retry_timer(pending_key) do
-    Process.send_after(self(), {:retry, pending_key}, @retry_interval)
   end
 
   defp log(x, label) do
