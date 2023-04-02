@@ -63,10 +63,23 @@ defmodule SparseSeq do
   end
 end
 
+defmodule SparseSeq2 do
+  alias Hallux.OrderedMap, as: OM
+
+  defdelegate new(ixs \\ []), to: OM
+
+  defdelegate insert(ss, k, v), to: OM
+
+  def slice_at(ss, i) do
+    {_less, _eq, greater} = OM.split(ss, i)
+    greater
+  end
+end
+
 defmodule Kafka do
   use GenServer
 
-  alias SparseSeq, as: SS
+  alias SparseSeq2, as: SS
 
   @offset "offset"
 
@@ -111,7 +124,7 @@ defmodule Kafka do
     log(msg, "got send req")
     %{"key" => k, "msg" => v, "msg_id" => orig_msg_id} = msg["body"]
     %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset, state.offset, state.offset + 1, state)
-    orig_key = {:orig, orig_msg_id}
+    orig_key = {:orig, msg["src"], orig_msg_id}
     state =
       state
       |> put_in([:pending, msg_id], {:bump_offset, {:send_ok, k, v, orig_key}})
@@ -126,7 +139,7 @@ defmodule Kafka do
         {:ok, offset} ->
           os =
             offset
-            |> SS.slice_at(off)
+            |> SS.slice_at(off - 1)
             |> serialize_sparse()
           Map.put(acc, topic, os)
 
@@ -159,15 +172,41 @@ defmodule Kafka do
       Map.update(acc, topic, i, &max(&1, i))
     end)
     state = %{state | committed: committed}
+    state.nodes
+    |> Stream.filter(& &1 != state.node_id)
+    |> Enum.each(fn n ->
+      body = %{
+        type: "replicate_commit",
+        committed: committed,
+      }
+      send!(state.node_id, n, body)
+    end)
     reply!(state.node_id, msg, %{type: "commit_offsets_ok"})
     {:noreply, state}
   end
   #
   # internal
   #
-  def handle_cast({:msg, %{"body" => %{"type" => "replicate"}} = msg}, state) do
-    log(msg, "got replicate req")
+  def handle_cast({:msg, %{"body" => %{"type" => "replicate_send"}} = msg}, state) do
+    log(msg, "got replicate_send req")
     %{"k" => k, "v" => v, "offset" => offset} = msg["body"]
+    # offset + 1 because offset is already used up here
+    new_offset = max(state.offset, offset + 1)
+    state =
+      state
+      |> Map.put(:offset, new_offset)
+      |> Map.update!(:topics, fn old ->
+        Map.update(old, k, SS.new([{offset, v}]), & SS.insert(&1, offset, v))
+      end)
+    {:noreply, state}
+  end
+  def handle_cast({:msg, %{"body" => %{"type" => "replicate_commit"}} = msg}, state) do
+    log(msg, "got replicate_commit req")
+    %{"committed" => committed} = msg["body"]
+    committed = Enum.reduce(committed, state.committed, fn {topic, i}, acc ->
+      Map.update(acc, topic, i, &max(&1, i))
+    end)
+    state = %{state | committed: committed}
     {:noreply, state}
   end
   #
@@ -216,32 +255,25 @@ defmodule Kafka do
   defp handle_next_action(state, {:send_ok, k, v, orig_key}) do
     offset = state.offset
     state = handle_send(state, k, v)
+    state.nodes
+    |> Stream.filter(& &1 != state.node_id)
+    |> Enum.each(fn n ->
+      body = %{
+        type: "replicate_send",
+        k: k,
+        v: v,
+        offset: offset,
+      }
+      send!(state.node_id, n, body)
+    end)
     {%{orig_msg: orig_msg}, state} = pop_in(state, [:pending, orig_key])
     reply!(state.node_id, orig_msg, %{type: "send_ok", offset: offset})
     state
   end
 
   defp serialize_sparse(ss) do
-    Enum.zip_with(ss.is, ss.xs, & [&1, &2])
-  end
-
-  defp kv_read!(k, state) do
-    body = %{
-      type: "read",
-      key: k,
-    }
-    send!(state.node_id, "lin-kv", body)
-  end
-
-  defp kv_cas!(k, v0, v1, state) do
-    body = %{
-      type: "cas",
-      key: k,
-      from: v0,
-      to: v1,
-      create_if_not_exists: true,
-    }
-    send!(state.node_id, "lin-kv", body)
+    # Enum.zip_with(ss.is, ss.xs, & [&1, &2])
+    Enum.map(ss, fn {i, x} -> [i, x] end)
   end
 
   defp reply!(from, original_msg, body) do
