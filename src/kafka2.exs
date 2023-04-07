@@ -292,7 +292,9 @@ defmodule Kafka do
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
       {{:bump_offset, topic, next_action}, state} ->
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@offset <> "_" <> topic, state)
+        cur_val = get_current_value_hack(msg)
+        state = put_in(state, [:offsets, topic], cur_val)
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset <> "_" <> topic, cur_val, cur_val + 1, state)
         state = put_in(state, [:pending, msg_id], {:bump_offset, topic, next_action})
         {:noreply, state}
     end
@@ -351,6 +353,11 @@ defmodule Kafka do
           |> put_in([:staging, topic], :gb_trees.empty())
         {0, state}
     end
+  end
+
+  defp get_current_value_hack(%{"body" => %{"text" => "current value " <> txt}}) do
+    {cur_val, _} = Integer.parse(txt)
+    cur_val
   end
 
   defp handle_next_action(state, {:send_ok, topic, v, orig_key}) do
