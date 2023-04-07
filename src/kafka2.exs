@@ -146,13 +146,13 @@ defmodule Kafka do
     state = %{
       node_id: nil,
       nodes: [],
-      offset: 0,
+      offsets: %{},
       topics: %{},
       committed: %{},
       pending: %{},
       # -1 so that 0 goes straight into the contiguous collection.
-      last_offset: -1,
-      staging: :gb_trees.empty(),
+      last_offsets: %{},
+      staging: %{},
     }
     {:ok, state}
   end
@@ -163,7 +163,9 @@ defmodule Kafka do
     end
     {:noreply, state}
   end
-  ## external msgs
+  #
+  # external
+  #
   def handle_cast({:msg, %{"body" => %{"type" => "init"}} = msg}, state) do
     log(msg, "got init")
     state = %{state | node_id: msg["body"]["node_id"], nodes: msg["body"]["node_ids"]}
@@ -173,11 +175,12 @@ defmodule Kafka do
   def handle_cast({:msg, %{"body" => %{"type" => "send"}} = msg}, state) do
     log(msg, "got send req")
     %{"key" => topic, "msg" => v, "msg_id" => orig_msg_id} = msg["body"]
-    %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset, state.offset, state.offset + 1, state)
+    {offset, state} = get_known_offset(state, topic)
+    %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset <> "_" <> topic, offset, offset + 1, state)
     orig_key = {:orig, msg["src"], orig_msg_id}
     state =
       state
-      |> put_in([:pending, msg_id], {:bump_offset, {:send_ok, topic, v, orig_key}})
+      |> put_in([:pending, msg_id], {:bump_offset, topic, {:send_ok, topic, v, orig_key}})
       |> put_in([:pending, orig_key], %{orig_msg: msg})
     {:noreply, state}
   end
@@ -241,11 +244,11 @@ defmodule Kafka do
     log(msg, "got replicate_send req")
     %{"k" => topic, "v" => v, "offset" => offset} = msg["body"]
     # offset + 1 because offset is already used up here
-    new_offset = max(state.offset, offset + 1)
+    new_offset = max(state.offsets[topic] || 0, offset + 1)
     state =
       state
       |> insert(topic, offset, v)
-      |> Map.put(:offset, new_offset)
+      |> put_in([:offsets, topic], new_offset)
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "replicate_commit"}} = msg}, state) do
@@ -265,10 +268,11 @@ defmodule Kafka do
     in_reply_to = msg["body"]["in_reply_to"]
     val = msg["body"]["value"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:bump_offset, next_action}, state} ->
-        state = %{state | offset: val}
-        %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset, state.offset, state.offset + 1, state)
-        state = put_in(state, [:pending, msg_id], {:bump_offset, next_action})
+      {{:bump_offset, topic, next_action}, state} ->
+        offset = val
+        state = put_in(state, [:offsets, topic], offset)
+        %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset <> "_" <> topic, offset, offset + 1, state)
+        state = put_in(state, [:pending, msg_id], {:bump_offset, topic, next_action})
         {:noreply, state}
     end
   end
@@ -276,9 +280,9 @@ defmodule Kafka do
     log(msg, "seq-kv cas_ok")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:bump_offset, next_action}, state} ->
+      {{:bump_offset, topic, next_action}, state} ->
         # Optimistically, next offset would be ours.
-        state = %{state | offset: state.offset + 1}
+        state = update_in(state, [:offsets, topic], & &1 + 1)
         state = handle_next_action(state, next_action)
         {:noreply, state}
     end
@@ -287,49 +291,72 @@ defmodule Kafka do
     log(msg, "seq-kv write or cas error (stale view)")
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
-      {{:bump_offset, next_action}, state} ->
-        %{body: %{"msg_id" => msg_id}} = kv_read!(@offset, state)
-        state = put_in(state, [:pending, msg_id], {:bump_offset, next_action})
+      {{:bump_offset, topic, next_action}, state} ->
+        %{body: %{"msg_id" => msg_id}} = kv_read!(@offset <> "_" <> topic, state)
+        state = put_in(state, [:pending, msg_id], {:bump_offset, topic, next_action})
         {:noreply, state}
     end
   end
 
   defp insert(state, topic, offset, v) do
-    if state.last_offset + 1 == offset do
+    last_offset = state.last_offsets[topic] || -1
+    if last_offset + 1 == offset do
       state
       |> insert1(topic, offset, v)
-      |> maybe_merge_staging()
+      |> update_in([:staging, topic], fn
+        nil ->
+          :gb_trees.empty()
+
+        s ->
+          s
+      end)
+      |> maybe_merge_staging(topic)
     else
-      Map.update!(state, :staging, & :gb_trees.insert(offset, {topic, v}, &1))
+      update_in(state, [:staging, topic], & :gb_trees.insert(offset, v, &1))
     end
   end
 
   defp insert1(state, topic, offset, v) do
     state
-    |> Map.update!(:last_offset, & &1 + 1)
+    |> update_in([:last_offsets, topic], & (&1 || - 1) + 1)
     |> Map.update!(:topics, fn old ->
       Map.update(old, topic, SS.new([{offset, v}]), & SS.insert(&1, offset, v))
     end)
   end
 
-  defp maybe_merge_staging(state) do
-    with false <- :gb_trees.is_empty(state.staging),
-         {first_k, {topic, first_v}, staging} <- :gb_trees.take_smallest(state.staging),
-         true <- first_k == state.last_offset + 1 do
+  defp maybe_merge_staging(state, topic) do
+    with false <- :gb_trees.is_empty(state.staging[topic]),
+         {first_k, first_v, staging} <- :gb_trees.take_smallest(state.staging[topic]),
+         true <- first_k == state.last_offsets[topic] + 1 do
       state
-      |> Map.put(:staging, staging)
+      |> put_in([:staging, topic], staging)
       |> insert1(topic, first_k, first_v)
-      |> maybe_merge_staging()
+      |> maybe_merge_staging(topic)
     else
       _ ->
         state
     end
   end
 
+  defp get_known_offset(state, topic) do
+    case state.offsets do
+      %{^topic => offset} ->
+        {offset, state}
+
+      _ ->
+        state =
+          state
+          |> put_in([:offsets, topic], 0)
+          |> put_in([:last_offsets, topic], -1)
+          |> put_in([:staging, topic], :gb_trees.empty())
+        {0, state}
+    end
+  end
+
   defp handle_next_action(state, {:send_ok, topic, v, orig_key}) do
     # Our current offset has just been cas'ed and reserved for us.
     # But we also just bumped it internally.
-    offset = state.offset - 1
+    offset = state.offsets[topic] - 1
     state = insert(state, topic, offset, v)
     state.nodes
     |> Stream.filter(& &1 != state.node_id)
@@ -348,7 +375,6 @@ defmodule Kafka do
   end
 
   defp serialize_sparse(ss) do
-    # Enum.zip_with(ss.is, ss.xs, & [&1, &2])
     Enum.map(ss, fn {i, x} -> [i, x] end)
   end
 
