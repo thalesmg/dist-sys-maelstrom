@@ -76,6 +76,53 @@ defmodule SparseSeq2 do
   end
 end
 
+defmodule SparseSeq3 do
+  alias Hallux.OrderedMap, as: OM
+
+  # keys are integers
+  defstruct [
+    contiguous: OM.new(),
+    staging: :gb_trees.empty(),
+  ]
+
+  # assumes ixs is contiguous (and non-duplicated)
+  def new(ixs \\ []) do
+    %__MODULE__{
+      contiguous: OM.new(ixs),
+      staging: :gb_trees.empty(),
+    }
+  end
+
+  def insert(ss = %__MODULE__{}, k, v) when is_integer(k) do
+    {last_k, _last_v} = Enum.at(ss.contiguous, -1)
+    if k == last_k + 1 do
+      ss = %{ss | contiguous: OM.insert(ss.contiguous, k, v)}
+      maybe_merge_staging(ss)
+    else
+      %{ss | staging: :gb_trees.insert(k, v, ss.staging)}
+    end
+  end
+
+  def slice_at(ss = %__MODULE__{contiguous: contiguous}, i) do
+    {_less, _eq, greater} = OM.split(contiguous, i)
+    greater
+  end
+
+  defp maybe_merge_staging(ss = %__MODULE__{contiguous: contiguous, staging: staging}) do
+    with false <- :gb_trees.is_empty(staging),
+         {first_k, first_v, staging} <- :gb_trees.take_smallest(staging),
+         {last_k, _last_v} = Enum.at(contiguous, -1),
+         true <- first_k == last_k + 1 do
+      contiguous = OM.insert(contiguous, first_k, first_v)
+      ss = %{ss | contiguous: contiguous, staging: staging}
+      maybe_merge_staging(ss)
+    else
+      _ ->
+        ss
+    end
+  end
+end
+
 defmodule Kafka do
   use GenServer
 
@@ -103,6 +150,9 @@ defmodule Kafka do
       topics: %{},
       committed: %{},
       pending: %{},
+      # -1 so that 0 goes straight into the contiguous collection.
+      last_offset: -1,
+      staging: :gb_trees.empty(),
     }
     {:ok, state}
   end
@@ -122,12 +172,12 @@ defmodule Kafka do
   end
   def handle_cast({:msg, %{"body" => %{"type" => "send"}} = msg}, state) do
     log(msg, "got send req")
-    %{"key" => k, "msg" => v, "msg_id" => orig_msg_id} = msg["body"]
+    %{"key" => topic, "msg" => v, "msg_id" => orig_msg_id} = msg["body"]
     %{body: %{"msg_id" => msg_id}} = kv_cas!(@offset, state.offset, state.offset + 1, state)
     orig_key = {:orig, msg["src"], orig_msg_id}
     state =
       state
-      |> put_in([:pending, msg_id], {:bump_offset, {:send_ok, k, v, orig_key}})
+      |> put_in([:pending, msg_id], {:bump_offset, {:send_ok, topic, v, orig_key}})
       |> put_in([:pending, orig_key], %{orig_msg: msg})
     {:noreply, state}
   end
@@ -189,15 +239,13 @@ defmodule Kafka do
   #
   def handle_cast({:msg, %{"body" => %{"type" => "replicate_send"}} = msg}, state) do
     log(msg, "got replicate_send req")
-    %{"k" => k, "v" => v, "offset" => offset} = msg["body"]
+    %{"k" => topic, "v" => v, "offset" => offset} = msg["body"]
     # offset + 1 because offset is already used up here
     new_offset = max(state.offset, offset + 1)
     state =
       state
+      |> insert(topic, offset, v)
       |> Map.put(:offset, new_offset)
-      |> Map.update!(:topics, fn old ->
-        Map.update(old, k, SS.new([{offset, v}]), & SS.insert(&1, offset, v))
-      end)
     {:noreply, state}
   end
   def handle_cast({:msg, %{"body" => %{"type" => "replicate_commit"}} = msg}, state) do
@@ -229,6 +277,8 @@ defmodule Kafka do
     in_reply_to = msg["body"]["in_reply_to"]
     case pop_in(state, [:pending, in_reply_to]) do
       {{:bump_offset, next_action}, state} ->
+        # Optimistically, next offset would be ours.
+        state = %{state | offset: state.offset + 1}
         state = handle_next_action(state, next_action)
         {:noreply, state}
     end
@@ -244,23 +294,49 @@ defmodule Kafka do
     end
   end
 
-  defp handle_send(state, k, v) do
+  defp insert(state, topic, offset, v) do
+    if state.last_offset + 1 == offset do
+      state
+      |> insert1(topic, offset, v)
+      |> maybe_merge_staging()
+    else
+      Map.update!(state, :staging, & :gb_trees.insert(offset, {topic, v}, &1))
+    end
+  end
+
+  defp insert1(state, topic, offset, v) do
     state
-    |> Map.update!(:offset, & &1 + 1)
+    |> Map.update!(:last_offset, & &1 + 1)
     |> Map.update!(:topics, fn old ->
-      Map.update(old, k, SS.new([{state.offset, v}]), & SS.insert(&1, state.offset, v))
+      Map.update(old, topic, SS.new([{offset, v}]), & SS.insert(&1, offset, v))
     end)
   end
 
-  defp handle_next_action(state, {:send_ok, k, v, orig_key}) do
-    offset = state.offset
-    state = handle_send(state, k, v)
+  defp maybe_merge_staging(state) do
+    with false <- :gb_trees.is_empty(state.staging),
+         {first_k, {topic, first_v}, staging} <- :gb_trees.take_smallest(state.staging),
+         true <- first_k == state.last_offset + 1 do
+      state
+      |> Map.put(:staging, staging)
+      |> insert1(topic, first_k, first_v)
+      |> maybe_merge_staging()
+    else
+      _ ->
+        state
+    end
+  end
+
+  defp handle_next_action(state, {:send_ok, topic, v, orig_key}) do
+    # Our current offset has just been cas'ed and reserved for us.
+    # But we also just bumped it internally.
+    offset = state.offset - 1
+    state = insert(state, topic, offset, v)
     state.nodes
     |> Stream.filter(& &1 != state.node_id)
     |> Enum.each(fn n ->
       body = %{
         type: "replicate_send",
-        k: k,
+        k: topic,
         v: v,
         offset: offset,
       }
